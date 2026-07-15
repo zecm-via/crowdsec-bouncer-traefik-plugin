@@ -10,8 +10,8 @@ import (
 	"net/url"
 	"strings"
 
-	cache "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/cache"
-	configuration "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/configuration"
+	cache "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/cache"
+	configuration "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/configuration"
 )
 
 // Client Captcha client.
@@ -121,6 +121,12 @@ func (c *Client) Check(remoteIP string) bool {
 	passed := value == cache.CaptchaDoneValue
 	c.log.Debug(fmt.Sprintf("captcha:Check ip:%s pass:%v", remoteIP, passed))
 	return passed
+}
+
+// IsValidationRequest reports whether the request contains a captcha response
+// for this captcha provider.
+func (c *Client) IsValidationRequest(r *http.Request) bool {
+	return c.Valid && c.infoProvider != nil && r.Method == http.MethodPost && r.FormValue(c.infoProvider.response) != ""
 }
 
 type responseProvider struct {
