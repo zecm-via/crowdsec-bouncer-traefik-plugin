@@ -86,42 +86,42 @@ type Bouncer struct {
 	name     string
 	template *template.Template
 
-	enabled                 bool
-	appsecEnabled           bool
-	appsecScheme            string
-	appsecHost              string
-	appsecPath              string
-	appsecKey               string
-	appsecFailureBlock      bool
-	appsecUnreachableBlock  bool
-	appsecBodyLimit         int64
-	crowdsecScheme          string
-	crowdsecHost            string
-	crowdsecPath            string
-	crowdsecKey             string
-	crowdsecMode            string
-	crowdsecMachineID       string
-	crowdsecPassword        string
-	crowdsecScenarios       []string
-	updateInterval          int64
-	updateMaxFailure        int64
-	defaultDecisionTimeout  int64
+	enabled                   bool
+	appsecEnabled             bool
+	appsecScheme              string
+	appsecHost                string
+	appsecPath                string
+	appsecKey                 string
+	appsecFailureBlock        bool
+	appsecUnreachableBlock    bool
+	appsecBodyLimit           int64
+	crowdsecScheme            string
+	crowdsecHost              string
+	crowdsecPath              string
+	crowdsecKey               string
+	crowdsecMode              string
+	crowdsecMachineID         string
+	crowdsecPassword          string
+	crowdsecScenarios         []string
+	updateInterval            int64
+	updateMaxFailure          int64
+	defaultDecisionTimeout    int64
 	captchaGracePeriodSeconds int64
-	remediationStatusCode   int
-	remediationCustomHeader string
-	forwardedCustomHeader   string
-	crowdsecStreamRoute     string
-	crowdsecHeader          string
-	redisUnreachableBlock   bool
-	banTemplate             *htmltemplate.Template
-	traceCustomHeader       string
-	clientPoolStrategy      *ip.PoolStrategy
-	serverPoolStrategy      *ip.PoolStrategy
-	httpClient              *http.Client
-	httpAppsecClient        *http.Client
-	cacheClient             *cache.Client
-	captchaClient           *captcha.Client
-	log                     *slog.Logger
+	remediationStatusCode     int
+	remediationCustomHeader   string
+	forwardedCustomHeader     string
+	crowdsecStreamRoute       string
+	crowdsecHeader            string
+	redisUnreachableBlock     bool
+	banTemplate               *htmltemplate.Template
+	traceCustomHeader         string
+	clientPoolStrategy        *ip.PoolStrategy
+	serverPoolStrategy        *ip.PoolStrategy
+	httpClient                *http.Client
+	httpAppsecClient          *http.Client
+	cacheClient               *cache.Client
+	captchaClient             *captcha.Client
+	log                       *slog.Logger
 }
 
 // New creates the crowdsec bouncer plugin.
@@ -197,36 +197,36 @@ func New(_ context.Context, next http.Handler, config *configuration.Config, nam
 		name:     name,
 		template: template.New("CrowdsecBouncer").Delims("[[", "]]"),
 
-		enabled:                 config.Enabled,
-		crowdsecMode:            config.CrowdsecMode,
-		appsecEnabled:           config.CrowdsecAppsecEnabled,
-		appsecScheme:            config.CrowdsecAppsecScheme,
-		appsecHost:              config.CrowdsecAppsecHost,
-		appsecPath:              config.CrowdsecAppsecPath,
-		appsecKey:               config.CrowdsecAppsecKey,
-		appsecFailureBlock:      config.CrowdsecAppsecFailureBlock,
-		appsecUnreachableBlock:  config.CrowdsecAppsecUnreachableBlock,
-		appsecBodyLimit:         config.CrowdsecAppsecBodyLimit,
-		crowdsecScheme:          config.CrowdsecLapiScheme,
-		crowdsecHost:            config.CrowdsecLapiHost,
-		crowdsecPath:            config.CrowdsecLapiPath,
-		crowdsecKey:             config.CrowdsecLapiKey,
-		crowdsecMachineID:       config.CrowdsecCapiMachineID,
-		crowdsecPassword:        config.CrowdsecCapiPassword,
-		crowdsecScenarios:       config.CrowdsecCapiScenarios,
-		updateInterval:          config.UpdateIntervalSeconds,
-		updateMaxFailure:        config.UpdateMaxFailure,
-		remediationCustomHeader: config.RemediationHeadersCustomName,
-		forwardedCustomHeader:   config.ForwardedHeadersCustomName,
-		defaultDecisionTimeout:  config.DefaultDecisionSeconds,
+		enabled:                   config.Enabled,
+		crowdsecMode:              config.CrowdsecMode,
+		appsecEnabled:             config.CrowdsecAppsecEnabled,
+		appsecScheme:              config.CrowdsecAppsecScheme,
+		appsecHost:                config.CrowdsecAppsecHost,
+		appsecPath:                config.CrowdsecAppsecPath,
+		appsecKey:                 config.CrowdsecAppsecKey,
+		appsecFailureBlock:        config.CrowdsecAppsecFailureBlock,
+		appsecUnreachableBlock:    config.CrowdsecAppsecUnreachableBlock,
+		appsecBodyLimit:           config.CrowdsecAppsecBodyLimit,
+		crowdsecScheme:            config.CrowdsecLapiScheme,
+		crowdsecHost:              config.CrowdsecLapiHost,
+		crowdsecPath:              config.CrowdsecLapiPath,
+		crowdsecKey:               config.CrowdsecLapiKey,
+		crowdsecMachineID:         config.CrowdsecCapiMachineID,
+		crowdsecPassword:          config.CrowdsecCapiPassword,
+		crowdsecScenarios:         config.CrowdsecCapiScenarios,
+		updateInterval:            config.UpdateIntervalSeconds,
+		updateMaxFailure:          config.UpdateMaxFailure,
+		remediationCustomHeader:   config.RemediationHeadersCustomName,
+		forwardedCustomHeader:     config.ForwardedHeadersCustomName,
+		defaultDecisionTimeout:    config.DefaultDecisionSeconds,
 		captchaGracePeriodSeconds: config.CaptchaGracePeriodSeconds,
-		remediationStatusCode:   config.RemediationStatusCode,
-		redisUnreachableBlock:   config.RedisCacheUnreachableBlock,
-		banTemplate:             banTemplate,
-		traceCustomHeader:       config.TraceHeadersCustomName,
-		crowdsecStreamRoute:     crowdsecStreamRoute,
-		crowdsecHeader:          crowdsecHeader,
-		log:                     log,
+		remediationStatusCode:     config.RemediationStatusCode,
+		redisUnreachableBlock:     config.RedisCacheUnreachableBlock,
+		banTemplate:               banTemplate,
+		traceCustomHeader:         config.TraceHeadersCustomName,
+		crowdsecStreamRoute:       crowdsecStreamRoute,
+		crowdsecHeader:            crowdsecHeader,
+		log:                       log,
 		serverPoolStrategy: &ip.PoolStrategy{
 			Checker: serverChecker,
 		},
@@ -492,8 +492,9 @@ func (bouncer *Bouncer) handleNextServeHTTP(rw http.ResponseWriter, req *http.Re
 	}
 
 	if bouncer.appsecEnabled {
-		appsecReq := bouncer.withCaptchaSolvedAppsecHeader(req, remoteIP)
-		remediation, err := appsecQuery(bouncer, remoteIP, appsecReq)
+		cleanupCaptchaSolvedHeader := bouncer.setCaptchaSolvedAppsecHeader(req, remoteIP)
+		remediation, err := appsecQuery(bouncer, remoteIP, req)
+		cleanupCaptchaSolvedHeader()
 		if err != nil {
 			bouncer.log.Debug(fmt.Sprintf("handleNextServeHTTP ip:%s isWaf:true %s", remoteIP, err.Error()))
 			if remediation == cache.CaptchaValue {
@@ -508,16 +509,21 @@ func (bouncer *Bouncer) handleNextServeHTTP(rw http.ResponseWriter, req *http.Re
 	bouncer.next.ServeHTTP(rw, req)
 }
 
-func (bouncer *Bouncer) withCaptchaSolvedAppsecHeader(req *http.Request, remoteIP string) *http.Request {
+func (bouncer *Bouncer) setCaptchaSolvedAppsecHeader(req *http.Request, remoteIP string) func() {
 	if bouncer.captchaClient == nil || !bouncer.captchaClient.Valid || !bouncer.captchaClient.Check(remoteIP) {
-		return req
+		return func() {}
 	}
 
-	appsecReq := req.Clone(req.Context())
-	appsecReq.Header = req.Header.Clone()
-	appsecReq.Header.Set(crowdsecCaptchaSolved, "1")
+	previous, existed := req.Header[crowdsecCaptchaSolved]
+	req.Header.Set(crowdsecCaptchaSolved, "1")
 
-	return appsecReq
+	return func() {
+		if existed {
+			req.Header[crowdsecCaptchaSolved] = previous
+			return
+		}
+		req.Header.Del(crowdsecCaptchaSolved)
+	}
 }
 
 func (bouncer *Bouncer) shouldHandleAppsecCaptchaValidation(req *http.Request, remoteIP string) bool {

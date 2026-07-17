@@ -3,6 +3,7 @@ package crowdsec_bouncer_traefik_plugin //nolint:revive,stylecheck
 import (
 	"context"
 	htmltemplate "html/template"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -390,7 +391,7 @@ func Test_appsecQuery_banRemediationFallback(t *testing.T) {
 	}
 }
 
-func TestBouncer_withCaptchaSolvedAppsecHeader(t *testing.T) {
+func TestBouncer_setCaptchaSolvedAppsecHeader(t *testing.T) {
 	cacheClient := &cache.Client{}
 	cacheClient.New(logger.New("INFO", ""), false, "", "", "")
 	cacheClient.Set("1.2.3.4_captcha", cache.CaptchaDoneValue, 60)
@@ -418,16 +419,104 @@ func TestBouncer_withCaptchaSolvedAppsecHeader(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req, _ := http.NewRequest(http.MethodGet, "http://localhost/", nil)
+	req, _ := http.NewRequest(http.MethodPost, "http://localhost/", strings.NewReader("payload=keep"))
+	bodyBefore := req.Body
 	req.Header.Set(crowdsecCaptchaSolved, "spoofed")
 	req.Header.Del(crowdsecCaptchaSolved)
 
-	appsecReq := bouncer.withCaptchaSolvedAppsecHeader(req, "1.2.3.4")
-	if got := appsecReq.Header.Get(crowdsecCaptchaSolved); got != "1" {
-		t.Fatalf("withCaptchaSolvedAppsecHeader() header = %q, want %q", got, "1")
+	cleanup := bouncer.setCaptchaSolvedAppsecHeader(req, "1.2.3.4")
+	if got := req.Header.Get(crowdsecCaptchaSolved); got != "1" {
+		t.Fatalf("setCaptchaSolvedAppsecHeader() header = %q, want %q", got, "1")
 	}
+	if req.Body != bodyBefore {
+		t.Fatal("setCaptchaSolvedAppsecHeader() changed request body")
+	}
+
+	cleanup()
 	if got := req.Header.Get(crowdsecCaptchaSolved); got != "" {
-		t.Fatalf("withCaptchaSolvedAppsecHeader() mutated original header = %q", got)
+		t.Fatalf("setCaptchaSolvedAppsecHeader() cleanup header = %q, want empty", got)
+	}
+	if req.Body != bodyBefore {
+		t.Fatal("setCaptchaSolvedAppsecHeader() cleanup changed request body")
+	}
+}
+
+func TestBouncer_handleNextServeHTTP_solvedCaptchaPreservesPostBody(t *testing.T) {
+	cacheClient := &cache.Client{}
+	cacheClient.New(logger.New("INFO", ""), false, "", "", "")
+	cacheClient.Set("1.2.3.4_captcha", cache.CaptchaDoneValue, 60)
+
+	var appsecBody string
+	appsecServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(crowdsecCaptchaSolved); got != "1" {
+			t.Errorf("AppSec solved header = %q, want %q", got, "1")
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read AppSec body: %v", err)
+		}
+		appsecBody = string(body)
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte(`{"action":"allow","http_status":200}`))
+	}))
+	defer appsecServer.Close()
+
+	appsecURL, _ := url.Parse(appsecServer.URL)
+
+	var backendBody string
+	next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(crowdsecCaptchaSolved); got != "" {
+			t.Errorf("backend received solved header = %q, want empty", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read backend body: %v", err)
+		}
+		backendBody = string(body)
+	})
+
+	bouncer := &Bouncer{
+		next:             next,
+		appsecEnabled:    true,
+		appsecScheme:     appsecURL.Scheme,
+		appsecHost:       appsecURL.Host,
+		appsecPath:       "/",
+		appsecBodyLimit:  1024,
+		httpAppsecClient: appsecServer.Client(),
+		cacheClient:      cacheClient,
+		captchaClient:    &captcha.Client{},
+		log:              logger.New("INFO", ""),
+	}
+	err := bouncer.captchaClient.New(
+		logger.New("INFO", ""),
+		cacheClient,
+		http.DefaultClient,
+		configuration.CustomProvider,
+		"https://captcha.example.test/fast.js",
+		"wicketkeeper",
+		"wicketkeeper_solution",
+		"https://captcha.example.test/v0/siteverify",
+		"wicketkeeper",
+		"wicketkeeper",
+		"",
+		"/captcha.html",
+		60,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const postBody = "authenticity_token=abc&SAMLRequest=xyz"
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/users/auth/saml", strings.NewReader(postBody))
+	rw := httptest.NewRecorder()
+
+	bouncer.handleNextServeHTTP(rw, req, "1.2.3.4")
+
+	if appsecBody != postBody {
+		t.Fatalf("AppSec body = %q, want %q", appsecBody, postBody)
+	}
+	if backendBody != postBody {
+		t.Fatalf("backend body = %q, want %q", backendBody, postBody)
 	}
 }
 

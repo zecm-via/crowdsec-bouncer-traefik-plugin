@@ -48,15 +48,19 @@ Changed files:
     - `{"action":"ban"}` or unknown/non-JSON response -> ban remediation.
   - Records a short pending AppSec CAPTCHA marker so the CAPTCHA validation POST
     is handled by the plugin.
-  - After successful CAPTCHA, sends `X-Crowdsec-Captcha-Solved: 1` only on the
-    AppSec subrequest.
+  - After successful CAPTCHA, temporarily adds `X-Crowdsec-Captcha-Solved: 1`
+    only while calling AppSec, then removes it before forwarding to the backend.
+  - Avoids cloning the request for solved-CAPTCHA AppSec checks because the
+    cloned request shares the original request body; reading the clone consumed
+    form POST bodies before they reached GitLab.
 - `pkg/captcha/captcha.go`
   - Adds `IsValidationRequest()` so the bouncer can detect the configured
     CAPTCHA response field without hardcoding provider-specific form names.
 - `bouncer_test.go`
   - Adds coverage for AppSec CAPTCHA response parsing.
   - Adds coverage for non-JSON AppSec 403 falling back to ban.
-  - Adds coverage for solved-CAPTCHA AppSec header injection.
+  - Adds coverage for solved-CAPTCHA AppSec header injection and cleanup without
+    changing the request body.
   - Adds coverage for the pending AppSec CAPTCHA validation path.
 - `go.mod`, `.traefik.yml`, and Go imports in test/package files
   - Change module/import path from upstream to the TU fork path:
