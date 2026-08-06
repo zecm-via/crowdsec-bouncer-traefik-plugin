@@ -5,8 +5,8 @@ package cache
 import (
 	"testing"
 
-	logger "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/logger"
 	simpleredis "github.com/maxlerebourg/simpleredis"
+	logger "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/logger"
 )
 
 func Test_Get(t *testing.T) {

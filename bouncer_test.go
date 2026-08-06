@@ -12,10 +12,11 @@ import (
 	"text/template"
 	"time"
 
-	cache "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/cache"
-	configuration "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/configuration"
-	ip "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/ip"
-	logger "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/logger"
+	cache "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/cache"
+	captcha "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/captcha"
+	configuration "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/configuration"
+	ip "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/ip"
+	logger "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/logger"
 )
 
 func TestServeHTTP(t *testing.T) {
@@ -462,7 +463,8 @@ func Test_appsecQuery_streamingDoesNotBlock(t *testing.T) {
 
 	finished := make(chan error, 1)
 	go func() {
-		finished <- appsecQuery(bouncer, "1.2.3.4", newStreamingRequest(done))
+		_, err := appsecQuery(bouncer, "1.2.3.4", newStreamingRequest(done))
+		finished <- err
 	}()
 
 	select {
@@ -500,7 +502,8 @@ func Test_appsecQuery_dropUnreadableBody(t *testing.T) {
 
 	finished := make(chan error, 1)
 	go func() {
-		finished <- appsecQuery(bouncer, "1.2.3.4", newStreamingRequest(done))
+		_, err := appsecQuery(bouncer, "1.2.3.4", newStreamingRequest(done))
+		finished <- err
 	}()
 
 	select {
@@ -543,7 +546,8 @@ func Test_appsecQuery_unreadableBodyGetNotDropped(t *testing.T) {
 
 	finished := make(chan error, 1)
 	go func() {
-		finished <- appsecQuery(bouncer, "1.2.3.4", newUnreadableGetRequest(done))
+		_, err := appsecQuery(bouncer, "1.2.3.4", newUnreadableGetRequest(done))
+		finished <- err
 	}()
 
 	select {
@@ -553,5 +557,234 @@ func Test_appsecQuery_unreadableBodyGetNotDropped(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("appsecQuery() blocked on an HTTP/3 GET request body (issue #351 regression)")
+	}
+}
+
+func Test_appsecQuery_captchaRemediation(t *testing.T) {
+	appsecServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(http.StatusForbidden)
+		_, _ = rw.Write([]byte(`{"action":"captcha","http_status":403}`))
+	}))
+	defer appsecServer.Close()
+
+	appsecURL, _ := url.Parse(appsecServer.URL)
+	bouncer := &Bouncer{
+		appsecScheme:     appsecURL.Scheme,
+		appsecHost:       appsecURL.Host,
+		appsecPath:       "/",
+		httpAppsecClient: appsecServer.Client(),
+		log:              logger.New("INFO", ""),
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, "http://localhost/", nil)
+	remediation, err := appsecQuery(bouncer, "1.2.3.4", req)
+	if err == nil {
+		t.Fatal("appsecQuery() expected an error for AppSec 403, got nil")
+	}
+	if remediation != cache.CaptchaValue {
+		t.Fatalf("appsecQuery() remediation = %q, want %q", remediation, cache.CaptchaValue)
+	}
+}
+
+func Test_appsecQuery_banRemediationFallback(t *testing.T) {
+	appsecServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusForbidden)
+		_, _ = rw.Write([]byte(`not-json`))
+	}))
+	defer appsecServer.Close()
+
+	appsecURL, _ := url.Parse(appsecServer.URL)
+	bouncer := &Bouncer{
+		appsecScheme:     appsecURL.Scheme,
+		appsecHost:       appsecURL.Host,
+		appsecPath:       "/",
+		httpAppsecClient: appsecServer.Client(),
+		log:              logger.New("INFO", ""),
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, "http://localhost/", nil)
+	remediation, err := appsecQuery(bouncer, "1.2.3.4", req)
+	if err == nil {
+		t.Fatal("appsecQuery() expected an error for AppSec 403, got nil")
+	}
+	if remediation != cache.BannedValue {
+		t.Fatalf("appsecQuery() remediation = %q, want %q", remediation, cache.BannedValue)
+	}
+}
+
+func TestBouncer_setCaptchaSolvedAppsecHeader(t *testing.T) {
+	cacheClient := &cache.Client{}
+	cacheClient.New(logger.New("INFO", ""), false, "", nil, "", "")
+	cacheClient.Set("1.2.3.4_captcha", cache.CaptchaDoneValue, 60)
+
+	bouncer := &Bouncer{
+		captchaClient: &captcha.Client{},
+		cacheClient:   cacheClient,
+	}
+	err := bouncer.captchaClient.New(
+		logger.New("INFO", ""),
+		cacheClient,
+		http.DefaultClient,
+		configuration.CustomProvider,
+		"https://captcha.example.test/fast.js",
+		"wicketkeeper",
+		"wicketkeeper_solution",
+		"https://captcha.example.test/v0/siteverify",
+		"wicketkeeper",
+		"wicketkeeper",
+		"",
+		"/captcha.html",
+		60,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, "http://localhost/", strings.NewReader("payload=keep"))
+	bodyBefore := req.Body
+	req.Header.Set(crowdsecCaptchaSolved, "spoofed")
+	req.Header.Del(crowdsecCaptchaSolved)
+
+	cleanup := bouncer.setCaptchaSolvedAppsecHeader(req, "1.2.3.4")
+	if got := req.Header.Get(crowdsecCaptchaSolved); got != "1" {
+		t.Fatalf("setCaptchaSolvedAppsecHeader() header = %q, want %q", got, "1")
+	}
+	if req.Body != bodyBefore {
+		t.Fatal("setCaptchaSolvedAppsecHeader() changed request body")
+	}
+
+	cleanup()
+	if got := req.Header.Get(crowdsecCaptchaSolved); got != "" {
+		t.Fatalf("setCaptchaSolvedAppsecHeader() cleanup header = %q, want empty", got)
+	}
+	if req.Body != bodyBefore {
+		t.Fatal("setCaptchaSolvedAppsecHeader() cleanup changed request body")
+	}
+}
+
+func TestBouncer_handleNextServeHTTP_solvedCaptchaPreservesPostBody(t *testing.T) {
+	cacheClient := &cache.Client{}
+	cacheClient.New(logger.New("INFO", ""), false, "", nil, "", "")
+	cacheClient.Set("1.2.3.4_captcha", cache.CaptchaDoneValue, 60)
+
+	var appsecBody string
+	appsecServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(crowdsecCaptchaSolved); got != "1" {
+			t.Errorf("AppSec solved header = %q, want %q", got, "1")
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read AppSec body: %v", err)
+		}
+		appsecBody = string(body)
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte(`{"action":"allow","http_status":200}`))
+	}))
+	defer appsecServer.Close()
+
+	appsecURL, _ := url.Parse(appsecServer.URL)
+
+	var backendBody string
+	next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(crowdsecCaptchaSolved); got != "" {
+			t.Errorf("backend received solved header = %q, want empty", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read backend body: %v", err)
+		}
+		backendBody = string(body)
+	})
+
+	bouncer := &Bouncer{
+		next:             next,
+		appsecEnabled:    true,
+		appsecScheme:     appsecURL.Scheme,
+		appsecHost:       appsecURL.Host,
+		appsecPath:       "/",
+		appsecBodyLimit:  1024,
+		httpAppsecClient: appsecServer.Client(),
+		cacheClient:      cacheClient,
+		captchaClient:    &captcha.Client{},
+		log:              logger.New("INFO", ""),
+	}
+	err := bouncer.captchaClient.New(
+		logger.New("INFO", ""),
+		cacheClient,
+		http.DefaultClient,
+		configuration.CustomProvider,
+		"https://captcha.example.test/fast.js",
+		"wicketkeeper",
+		"wicketkeeper_solution",
+		"https://captcha.example.test/v0/siteverify",
+		"wicketkeeper",
+		"wicketkeeper",
+		"",
+		"/captcha.html",
+		60,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const postBody = "authenticity_token=abc&SAMLRequest=xyz"
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/users/auth/saml", strings.NewReader(postBody))
+	rw := httptest.NewRecorder()
+
+	bouncer.handleNextServeHTTP(rw, req, "1.2.3.4")
+
+	if appsecBody != postBody {
+		t.Fatalf("AppSec body = %q, want %q", appsecBody, postBody)
+	}
+	if backendBody != postBody {
+		t.Fatalf("backend body = %q, want %q", backendBody, postBody)
+	}
+}
+
+func TestBouncer_shouldHandleAppsecCaptchaValidation(t *testing.T) {
+	cacheClient := &cache.Client{}
+	cacheClient.New(logger.New("INFO", ""), false, "", nil, "", "")
+
+	bouncer := &Bouncer{
+		captchaClient:             &captcha.Client{},
+		cacheClient:               cacheClient,
+		captchaGracePeriodSeconds: 60,
+	}
+	err := bouncer.captchaClient.New(
+		logger.New("INFO", ""),
+		cacheClient,
+		http.DefaultClient,
+		configuration.CustomProvider,
+		"https://captcha.example.test/fast.js",
+		"wicketkeeper",
+		"wicketkeeper_solution",
+		"https://captcha.example.test/v0/siteverify",
+		"wicketkeeper",
+		"wicketkeeper",
+		"",
+		"/captcha.html",
+		60,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newCaptchaValidationRequest := func() *http.Request {
+		body := "wicketkeeper_solution=test-token"
+		req, _ := http.NewRequest(http.MethodPost, "http://localhost/", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return req
+	}
+
+	const remoteIP = "5.6.7.8"
+
+	if bouncer.shouldHandleAppsecCaptchaValidation(newCaptchaValidationRequest(), remoteIP) {
+		t.Fatal("shouldHandleAppsecCaptchaValidation() = true without pending marker, want false")
+	}
+
+	bouncer.setAppsecCaptchaPending(remoteIP)
+	if !bouncer.shouldHandleAppsecCaptchaValidation(newCaptchaValidationRequest(), remoteIP) {
+		t.Fatal("shouldHandleAppsecCaptchaValidation() = false with pending marker and captcha response, want true")
 	}
 }

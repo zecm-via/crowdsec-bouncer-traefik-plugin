@@ -19,11 +19,11 @@ import (
 	"text/template"
 	"time"
 
-	cache "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/cache"
-	captcha "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/captcha"
-	configuration "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/configuration"
-	ip "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/ip"
-	logger "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/logger"
+	cache "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/cache"
+	captcha "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/captcha"
+	configuration "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/configuration"
+	ip "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/ip"
+	logger "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/logger"
 )
 
 const (
@@ -33,6 +33,7 @@ const (
 	crowdsecAppsecVerbHeader = "X-Crowdsec-Appsec-Verb"
 	crowdsecAppsecHeader     = "X-Crowdsec-Appsec-Api-Key"
 	crowdsecAppsecUserAgent  = "X-Crowdsec-Appsec-User-Agent"
+	crowdsecCaptchaSolved    = "X-Crowdsec-Captcha-Solved"
 	crowdsecLapiHeader       = "X-Api-Key"
 	crowdsecLapiRoute        = "v1/decisions"
 	crowdsecLapiStreamRoute  = "v1/decisions/stream"
@@ -42,6 +43,7 @@ const (
 	crowdsecCapiLoginRoute   = "v2/watchers/login"
 	crowdsecCapiStreamRoute  = "v2/decisions/stream"
 	cacheTimeoutKey          = "updated"
+	appsecCaptchaPendingTTL  = 300
 )
 
 // ##############################################################
@@ -104,6 +106,7 @@ type Bouncer struct {
 	updateInterval            int64
 	updateMaxFailure          int64
 	defaultDecisionTimeout    int64
+	captchaGracePeriodSeconds int64
 	remediationStatusCode     int
 	remediationCustomHeader   string
 	forwardedCustomHeader     string
@@ -227,6 +230,7 @@ func New(_ context.Context, next http.Handler, config *configuration.Config, nam
 		remediationCustomHeader:   config.RemediationHeadersCustomName,
 		forwardedCustomHeader:     config.ForwardedHeadersCustomName,
 		defaultDecisionTimeout:    config.DefaultDecisionSeconds,
+		captchaGracePeriodSeconds: config.CaptchaGracePeriodSeconds,
 		remediationStatusCode:     config.RemediationStatusCode,
 		redisUnreachableBlock:     config.RedisCacheUnreachableBlock,
 		banTemplate:               banTemplate,
@@ -332,6 +336,10 @@ func New(_ context.Context, next http.Handler, config *configuration.Config, nam
 //
 //nolint:nestif
 func (bouncer *Bouncer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	// This header is internal between the Traefik plugin and AppSec. Strip any
+	// client-supplied value before we optionally add a trusted value ourselves.
+	req.Header.Del(crowdsecCaptchaSolved)
+
 	if !bouncer.enabled {
 		bouncer.next.ServeHTTP(rw, req)
 		return
@@ -486,14 +494,77 @@ func (bouncer *Bouncer) handleRemediationServeHTTP(rw http.ResponseWriter, req *
 }
 
 func (bouncer *Bouncer) handleNextServeHTTP(rw http.ResponseWriter, req *http.Request, remoteIP string) {
+	if bouncer.shouldHandleAppsecCaptchaValidation(req, remoteIP) {
+		bouncer.captchaClient.ServeHTTP(rw, req, remoteIP)
+		if bouncer.captchaClient.Check(remoteIP) {
+			bouncer.cacheClient.Delete(appsecCaptchaPendingKey(remoteIP))
+		}
+		return
+	}
+
 	if bouncer.appsecEnabled {
-		if err := appsecQuery(bouncer, remoteIP, req); err != nil {
+		cleanupCaptchaSolvedHeader := bouncer.setCaptchaSolvedAppsecHeader(req, remoteIP)
+		remediation, err := appsecQuery(bouncer, remoteIP, req)
+		cleanupCaptchaSolvedHeader()
+		if err != nil {
 			bouncer.log.Debug(fmt.Sprintf("handleNextServeHTTP ip:%s isWaf:true %s", remoteIP, err.Error()))
+			if remediation == cache.CaptchaValue {
+				bouncer.setAppsecCaptchaPending(remoteIP)
+				bouncer.handleRemediationServeHTTP(rw, req, remoteIP, remediation)
+				return
+			}
 			bouncer.handleBanServeHTTP(rw, req, remoteIP, configuration.ReasonAPPSEC)
 			return
 		}
 	}
 	bouncer.next.ServeHTTP(rw, req)
+}
+
+func (bouncer *Bouncer) setCaptchaSolvedAppsecHeader(req *http.Request, remoteIP string) func() {
+	if bouncer.captchaClient == nil || !bouncer.captchaClient.Valid || !bouncer.captchaClient.Check(remoteIP) {
+		return func() {}
+	}
+
+	previous, existed := req.Header[crowdsecCaptchaSolved]
+	req.Header.Set(crowdsecCaptchaSolved, "1")
+
+	return func() {
+		if existed {
+			req.Header[crowdsecCaptchaSolved] = previous
+			return
+		}
+		req.Header.Del(crowdsecCaptchaSolved)
+	}
+}
+
+func (bouncer *Bouncer) shouldHandleAppsecCaptchaValidation(req *http.Request, remoteIP string) bool {
+	if bouncer.captchaClient == nil || !bouncer.captchaClient.Valid || bouncer.cacheClient == nil {
+		return false
+	}
+	value, err := bouncer.cacheClient.Get(appsecCaptchaPendingKey(remoteIP))
+	if err != nil || value != cache.CaptchaValue {
+		return false
+	}
+	if bouncer.captchaClient.Check(remoteIP) {
+		return false
+	}
+	return bouncer.captchaClient.IsValidationRequest(req)
+}
+
+func (bouncer *Bouncer) setAppsecCaptchaPending(remoteIP string) {
+	if bouncer.cacheClient == nil {
+		return
+	}
+
+	ttl := bouncer.captchaGracePeriodSeconds
+	if ttl <= 0 {
+		ttl = appsecCaptchaPendingTTL
+	}
+	bouncer.cacheClient.Set(appsecCaptchaPendingKey(remoteIP), cache.CaptchaValue, ttl)
+}
+
+func appsecCaptchaPendingKey(remoteIP string) string {
+	return remoteIP + "_appsec_captcha"
 }
 
 func handleStreamTicker(bouncer *Bouncer) {
@@ -746,7 +817,12 @@ func isMethodWithBody(method string) bool {
 	}
 }
 
-func appsecQuery(bouncer *Bouncer, ip string, httpReq *http.Request) error {
+type appsecResponse struct {
+	Action     string `json:"action"`
+	HTTPStatus int    `json:"http_status"`
+}
+
+func appsecQuery(bouncer *Bouncer, ip string, httpReq *http.Request) (string, error) {
 	routeURL := url.URL{
 		Scheme: bouncer.appsecScheme,
 		Host:   bouncer.appsecHost,
@@ -756,7 +832,7 @@ func appsecQuery(bouncer *Bouncer, ip string, httpReq *http.Request) error {
 	switch {
 	case isBodyUnreadable(httpReq):
 		if bouncer.appsecUnreadableBodyBlock && isMethodWithBody(httpReq.Method) {
-			return errors.New("appsecQuery:unreadableBody dropped")
+			return cache.BannedValue, errors.New("appsecQuery:unreadableBody dropped")
 		}
 		req, _ = http.NewRequest(http.MethodGet, routeURL.String(), nil)
 	case bouncer.appsecBodyLimit > 0 && httpReq.Body != nil:
@@ -765,7 +841,7 @@ func appsecQuery(bouncer *Bouncer, ip string, httpReq *http.Request) error {
 		teeReader := io.TeeReader(limitedReader, &bodyBuffer)
 		bodyBytes, err := io.ReadAll(teeReader)
 		if err != nil {
-			return fmt.Errorf("appsecQuery:GetBody %w", err)
+			return cache.BannedValue, fmt.Errorf("appsecQuery:GetBody %w", err)
 		}
 		// Conserve body intact after reading it for other middlewares and service
 		httpReq.Body = io.NopCloser(io.MultiReader(&bodyBuffer, httpReq.Body))
@@ -788,12 +864,12 @@ func appsecQuery(bouncer *Bouncer, ip string, httpReq *http.Request) error {
 	req.Header.Set("User-Agent", "Crowdsec-Bouncer-Traefik-Plugin/"+pluginVersion)
 
 	res, err := bouncer.httpAppsecClient.Do(req)
-	if err != nil || isReverseProxyError(res.StatusCode) {
+	if err != nil || (res != nil && isReverseProxyError(res.StatusCode)) {
 		bouncer.log.Error("appsecQuery:unreachable")
 		if bouncer.appsecUnreachableBlock {
-			return fmt.Errorf("appsecQuery:unreachable %w", err)
+			return cache.BannedValue, fmt.Errorf("appsecQuery:unreachable %w", err)
 		}
-		return nil
+		return cache.NoBannedValue, nil
 	}
 	defer func() {
 		if err = res.Body.Close(); err != nil {
@@ -803,18 +879,46 @@ func appsecQuery(bouncer *Bouncer, ip string, httpReq *http.Request) error {
 	if res.StatusCode == http.StatusInternalServerError {
 		bouncer.log.Info("appsecQuery:failure")
 		if bouncer.appsecFailureBlock {
-			return errors.New("appsecQuery statusCode:500")
+			return cache.BannedValue, errors.New("appsecQuery statusCode:500")
 		}
-		return nil
+		return cache.NoBannedValue, nil
 	}
 	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("appsecQuery statusCode:%d", res.StatusCode)
+		remediation := appsecRemediationFromResponse(res, bouncer.log)
+		return remediation, fmt.Errorf("appsecQuery statusCode:%d remediation:%s", res.StatusCode, remediation)
 	}
 
+	return cache.NoBannedValue, nil
+}
+
+func appsecRemediationFromResponse(res *http.Response, log *slog.Logger) string {
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return fmt.Errorf("appsecQuery:readBody %w", err)
+		if log != nil {
+			log.Debug("appsecRemediationFromResponse:readBody " + err.Error())
+		}
+		return cache.BannedValue
 	}
-	return nil
+
+	var appsecResp appsecResponse
+	if err = json.Unmarshal(body, &appsecResp); err != nil {
+		if log != nil {
+			log.Debug("appsecRemediationFromResponse:json " + err.Error())
+		}
+		return cache.BannedValue
+	}
+
+	switch strings.ToLower(appsecResp.Action) {
+	case "captcha":
+		return cache.CaptchaValue
+	case "ban":
+		return cache.BannedValue
+	default:
+		if log != nil {
+			log.Debug("appsecRemediationFromResponse:unknownAction " + appsecResp.Action)
+		}
+		return cache.BannedValue
+	}
 }
 
 func reportMetrics(bouncer *Bouncer) error {

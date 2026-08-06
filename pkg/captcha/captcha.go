@@ -10,8 +10,8 @@ import (
 	"strings"
 	"text/template"
 
-	cache "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/cache"
-	configuration "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/configuration"
+	cache "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/cache"
+	configuration "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/configuration"
 )
 
 // Client Captcha client.
@@ -123,6 +123,17 @@ func (c *Client) Check(remoteIP string) bool {
 	passed := value == cache.CaptchaDoneValue
 	c.log.Debug(fmt.Sprintf("captcha:Check ip:%s pass:%v", remoteIP, passed))
 	return passed
+}
+
+// IsValidationRequest reports whether the request carries the configured
+// CAPTCHA response field. This lets the bouncer route AppSec-triggered CAPTCHA
+// validation posts to the CAPTCHA provider without hardcoding provider-specific
+// form field names.
+func (c *Client) IsValidationRequest(r *http.Request) bool {
+	if c == nil || c.infoProvider == nil || c.infoProvider.response == "" {
+		return false
+	}
+	return r.FormValue(c.infoProvider.response) != ""
 }
 
 type responseProvider struct {
