@@ -1,6 +1,10 @@
-.PHONY: lint test vendor clean
+.PHONY: lint test vendor clean e2e_mock
 
 export GO111MODULE=on
+
+# Binary/mock suite (Traefik binary + mock LAPI). This is what CI runs.
+# The local Docker suite (make e2e) lives in a separate PR/branch.
+E2E_MOCK_SCENARIOS := $(notdir $(wildcard tests/e2e/mock/scenarios/*))
 
 default: lint test
 
@@ -12,6 +16,11 @@ test:
 
 yaegi_test:
 	yaegi test -v .
+
+e2e_mock: $(addprefix e2e_mock_,$(E2E_MOCK_SCENARIOS))
+
+e2e_mock_%:
+	bash ./tests/e2e/mock/scenarios/$*/run.sh
 
 vendor:
 	go mod vendor
@@ -42,6 +51,9 @@ run_tlsauth:
 
 run_appsec:
 	docker compose -f examples/appsec-enabled/docker-compose.yml up -d --remove-orphans
+
+run_bot_detection:
+	docker compose -f examples/bot-detection/docker-compose.yml up -d --remove-orphans
 
 run_custom_captcha:
 	docker compose -f examples/custom-captcha/docker-compose.yml up -d --remove-orphans
@@ -100,6 +112,7 @@ clean_all_docker:
 	docker compose -f examples/trusted-ips/docker-compose.yml down --remove-orphans
 	docker compose -f examples/tls-auth/docker-compose.yml down --remove-orphans
 	docker compose -f examples/appsec-enabled/docker-compose.yml down --remove-orphans
+	docker compose -f examples/bot-detection/docker-compose.yml down --remove-orphans
 	docker compose -f examples/captcha/docker-compose.yml down --remove-orphans
 	docker compose -f examples/custom-captcha/docker-compose.yml down --remove-orphans
 	docker compose -f examples/custom-ban-page/docker-compose.yml down --remove-orphans
@@ -115,4 +128,3 @@ show_metrics:
 
 show_decisions:
 	docker exec crowdsec cscli decisions list
-

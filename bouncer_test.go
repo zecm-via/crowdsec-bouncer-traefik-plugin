@@ -2,16 +2,23 @@ package crowdsec_bouncer_traefik_plugin //nolint:revive,stylecheck
 
 import (
 	"context"
-	htmltemplate "html/template"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"text/template"
+	"time"
 
 	cache "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/cache"
 	configuration "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/configuration"
 	ip "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/ip"
+	logger "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/logger"
 )
 
 func TestServeHTTP(t *testing.T) {
@@ -118,45 +125,100 @@ func TestBouncer_ServeHTTP(t *testing.T) {
 }
 
 func Test_handleNoStreamCache(t *testing.T) {
-	type args struct {
-		bouncer  *Bouncer
-		remoteIP string
+	newBouncer := func(mode string, updateMaxFailure int64) *Bouncer {
+		log := logger.New("ERROR", "")
+		cacheClient := &cache.Client{}
+		cacheClient.New(log, false, "", nil, "", "")
+		return &Bouncer{
+			crowdsecScheme:         "http",
+			crowdsecHost:           "127.0.0.1:1",
+			crowdsecPath:           "/",
+			crowdsecMode:           mode,
+			updateMaxFailure:       updateMaxFailure,
+			defaultDecisionTimeout: 60,
+			httpClient:             &http.Client{Timeout: time.Second},
+			cacheClient:            cacheClient,
+			log:                    log,
+		}
 	}
+
 	tests := []struct {
-		name    string
-		args    args
-		wantErr bool
+		name             string
+		mode             string
+		updateMaxFailure int64
+		want             string
+		wantErr          bool
 	}{
-		// TODO: Add test cases.
+		{
+			name:             "live mode blocks by default when crowdsec is unreachable",
+			mode:             configuration.LiveMode,
+			updateMaxFailure: 0,
+			want:             cache.BannedValue,
+			wantErr:          true,
+		},
+		{
+			name:             "live mode blocks for any positive updateMaxFailure",
+			mode:             configuration.LiveMode,
+			updateMaxFailure: 3,
+			want:             cache.BannedValue,
+			wantErr:          true,
+		},
+		{
+			name:             "live mode lets the request through when updateMaxFailure is -1",
+			mode:             configuration.LiveMode,
+			updateMaxFailure: -1,
+			want:             cache.NoBannedValue,
+			wantErr:          true,
+		},
+		{
+			name:             "none mode lets the request through when updateMaxFailure is -1",
+			mode:             configuration.NoneMode,
+			updateMaxFailure: -1,
+			want:             cache.NoBannedValue,
+			wantErr:          true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := handleNoStreamCache(tt.args.bouncer, tt.args.remoteIP); (err != nil) != tt.wantErr {
+			got, err := handleNoStreamCache(newBouncer(tt.mode, tt.updateMaxFailure), "1.2.3.4")
+			if (err != nil) != tt.wantErr {
 				t.Errorf("handleNoStreamCache() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("handleNoStreamCache() = %q, want %q", got, tt.want)
 			}
 		})
 	}
 }
 
 func Test_handleStreamCache(t *testing.T) {
-	type args struct {
-		bouncer *Bouncer
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{
+			"deleted": [{"type": "captcha", "scope": "Ip", "value": "192.0.2.10", "duration": "-1s"}],
+			"new": [{"type": "ban", "scope": "Ip", "value": "192.0.2.10", "duration": "1h"}]
+		}`))
+	}))
+	defer server.Close()
+	serverURL, _ := url.Parse(server.URL)
+	log := logger.New("ERROR", "")
+	cacheClient := &cache.Client{}
+	cacheClient.New(log, false, "", nil, "", "")
+	bouncer := &Bouncer{
+		crowdsecScheme:      serverURL.Scheme,
+		crowdsecHost:        serverURL.Host,
+		crowdsecHeader:      "X-Api-Key",
+		crowdsecStreamRoute: "/v1/decisions/stream",
+		updateInterval:      60,
+		httpClient:          server.Client(),
+		cacheClient:         cacheClient,
+		log:                 log,
 	}
-	tests := []struct {
-		name    string
-		args    args
-		wantErr bool
-	}{
-		// TODO: Add test cases.
+
+	if err := handleStreamCache(bouncer); err != nil {
+		t.Fatalf("handleStreamCache() error = %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := handleStreamCache(tt.args.bouncer)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("handleStreamCache() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-		})
+	if got, err := cacheClient.Get("192.0.2.10"); err != nil || got != cache.BannedValue {
+		t.Errorf("expected the replacing ban to be cached, got %q, %v", got, err)
 	}
 }
 
@@ -190,11 +252,11 @@ func Test_crowdsecQuery(t *testing.T) {
 
 func TestHandleBanServeHTTPWithDifferentMethods(t *testing.T) {
 	html := "<html>You are banned</html>"
-	banTemplate, _ := htmltemplate.New("html").Parse(html)
+	banTemplate, _ := template.New("html").Delims("{{", "}}").Parse(html)
 	tests := []struct {
 		name              string
 		method            string
-		banTemplate       *htmltemplate.Template
+		banTemplate       *template.Template
 		expectBodyContent bool
 	}{
 		{
@@ -235,6 +297,7 @@ func TestHandleBanServeHTTPWithDifferentMethods(t *testing.T) {
 				remediationStatusCode:   http.StatusForbidden,
 				remediationCustomHeader: "X-Test-Remediation",
 				banTemplate:             tt.banTemplate,
+				banTemplateContentType:  "text/html; charset=utf-8",
 			}
 
 			rw := httptest.NewRecorder()
@@ -264,6 +327,50 @@ func TestHandleBanServeHTTPWithDifferentMethods(t *testing.T) {
 			// If we expect body content, verify it matches template
 			if tt.expectBodyContent && body != html {
 				t.Errorf("Expected body %q, got %q", html, body)
+			}
+		})
+	}
+}
+
+func TestHandleBanServeHTTPContentType(t *testing.T) {
+	html := "<html>You are banned</html>"
+	banTemplate, _ := template.New("html").Delims("{{", "}}").Parse(html)
+	tests := []struct {
+		name                   string
+		banTemplate            *template.Template
+		banTemplateContentType string
+	}{
+		{
+			name:                   "Default HTML content type",
+			banTemplate:            banTemplate,
+			banTemplateContentType: "text/html; charset=utf-8",
+		},
+		{
+			name:                   "Custom JSON content type",
+			banTemplate:            banTemplate,
+			banTemplateContentType: "application/json",
+		},
+		{
+			name:                   "Content type set even when banTemplate is nil",
+			banTemplate:            nil,
+			banTemplateContentType: "application/json",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bouncer := &Bouncer{
+				remediationStatusCode:  http.StatusForbidden,
+				banTemplate:            tt.banTemplate,
+				banTemplateContentType: tt.banTemplateContentType,
+			}
+
+			rw := httptest.NewRecorder()
+			req := &http.Request{Method: http.MethodGet}
+			bouncer.handleBanServeHTTP(rw, req, "0.0.0.0", "TEST")
+
+			if got := rw.Header().Get("Content-Type"); got != tt.banTemplateContentType {
+				t.Errorf("Expected Content-Type %q, got %q", tt.banTemplateContentType, got)
 			}
 		})
 	}
@@ -328,6 +435,737 @@ func TestCaptchaMethodBasedLogic(t *testing.T) {
 			if shouldUseCaptcha == tt.expectBanFallback {
 				t.Errorf("Method %s with %s remediation: expected ban fallback %v, but logic would use captcha %v",
 					tt.method, tt.remediation, tt.expectBanFallback, shouldUseCaptcha)
+			}
+		})
+	}
+}
+
+// blockingBody simulates a request body that never reaches EOF, like a
+// bidirectional gRPC stream that keeps its body open for the whole life of
+// the connection. Reading from it blocks until the test is done.
+type blockingBody struct {
+	done <-chan struct{}
+}
+
+func (b blockingBody) Read(_ []byte) (int, error) {
+	<-b.done
+	return 0, io.EOF
+}
+
+func (blockingBody) Close() error { return nil }
+
+func Test_isBodyUnreadable(t *testing.T) {
+	realBody := func() io.ReadCloser { return io.NopCloser(strings.NewReader("data")) }
+	tests := []struct {
+		name          string
+		protoMajor    int
+		contentLength int64
+		body          io.ReadCloser
+		want          bool
+	}{
+		{name: "http2 grpc stream without content-length", protoMajor: 2, contentLength: -1, body: realBody(), want: true},
+		{name: "http3 stream without content-length", protoMajor: 3, contentLength: -1, body: realBody(), want: true},
+		{name: "http2 with content-length", protoMajor: 2, contentLength: 42, body: realBody(), want: false},
+		{name: "http1.1 chunked without content-length", protoMajor: 1, contentLength: -1, body: realBody(), want: false},
+		{name: "http2 without body", protoMajor: 2, contentLength: -1, body: nil, want: false},
+		{name: "http2 with http.NoBody", protoMajor: 2, contentLength: -1, body: http.NoBody, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, "http://localhost", nil)
+			req.ProtoMajor = tt.protoMajor
+			req.ContentLength = tt.contentLength
+			req.Body = tt.body
+			if got := isBodyUnreadable(req); got != tt.want {
+				t.Errorf("isBodyUnreadable() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func newUnreadableRequest(method string, done <-chan struct{}) *http.Request {
+	req, _ := http.NewRequest(method, "http://localhost/api/admin/reservations/8fff14a2", blockingBody{done: done})
+	req.ProtoMajor = 3
+	req.ContentLength = -1
+	return req
+}
+
+// newStreamingRequest builds an HTTP/2 request whose body never reaches EOF,
+// like a bidirectional gRPC stream (issue #323).
+func newStreamingRequest(done <-chan struct{}) *http.Request {
+	req, _ := http.NewRequest(http.MethodPost, "http://localhost/signalexchange.SignalExchange/ConnectStream", blockingBody{done: done})
+	req.Header.Set("Content-Type", "application/grpc")
+	req.ProtoMajor = 2
+	req.ContentLength = -1
+	return req
+}
+
+// Test_appsecQuery_streamingDoesNotBlock is a regression test for issue #323:
+// a gRPC streaming request whose body never reaches EOF must not be buffered
+// (io.ReadAll would block until timeout and wrongly produce a 403). The appsec
+// query must complete promptly, inspecting headers only.
+func Test_appsecQuery_streamingDoesNotBlock(t *testing.T) {
+	appsecServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	}))
+	defer appsecServer.Close()
+
+	appsecURL, _ := url.Parse(appsecServer.URL)
+	bouncer := &Bouncer{
+		appsecScheme:           appsecURL.Scheme,
+		appsecHost:             appsecURL.Host,
+		appsecPath:             "/",
+		appsecBodyLimit:        10485760,
+		appsecUnreachableBlock: true,
+		appsecFailureBlock:     true,
+		httpAppsecClient:       appsecServer.Client(),
+		log:                    logger.New("INFO", ""),
+	}
+
+	done := make(chan struct{})
+	defer close(done)
+
+	finished := make(chan error, 1)
+	go func() {
+		_, err := appsecQuery(bouncer, "1.2.3.4", newStreamingRequest(done))
+		finished <- err
+	}()
+
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Errorf("appsecQuery() on streaming request returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("appsecQuery() blocked on a streaming request body (issue #323 regression)")
+	}
+}
+
+// Test_appsecQuery_dropUnreadableBody verifies that, when configured to do so,
+// a request with an unreadable body is dropped (blocked) instead of forwarded
+// without its body, mirroring the reference APPSEC_DROP_UNREADABLE_BODY option.
+func Test_appsecQuery_dropUnreadableBody(t *testing.T) {
+	appsecServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	}))
+	defer appsecServer.Close()
+
+	appsecURL, _ := url.Parse(appsecServer.URL)
+	bouncer := &Bouncer{
+		appsecScheme:              appsecURL.Scheme,
+		appsecHost:                appsecURL.Host,
+		appsecPath:                "/",
+		appsecBodyLimit:           10485760,
+		appsecUnreadableBodyBlock: true,
+		httpAppsecClient:          appsecServer.Client(),
+		log:                       logger.New("INFO", ""),
+	}
+
+	type bodyReq func(done <-chan struct{}) *http.Request
+	tests := []struct {
+		name    string
+		req     bodyReq
+		wantErr bool
+	}{
+		// a streaming body that never reaches EOF is unreadable: the request is dropped.
+		{name: "streaming request is dropped", req: newStreamingRequest, wantErr: true},
+		// issue #351 regression: an HTTP/3 GET without content-length has no body to read, so it must not be dropped.
+		{name: "bodyless HTTP/3 GET is not dropped", req: func(done <-chan struct{}) *http.Request { return newUnreadableRequest(http.MethodGet, done) }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			done := make(chan struct{})
+			defer close(done)
+
+			finished := make(chan error, 1)
+			go func() {
+				_, err := appsecQuery(bouncer, "1.2.3.4", tc.req(done))
+				finished <- err
+			}()
+
+			select {
+			case err := <-finished:
+				if tc.wantErr && err == nil {
+					t.Error("appsecQuery() expected the request to be dropped, got nil")
+				}
+				if !tc.wantErr && err != nil {
+					t.Errorf("appsecQuery() returned error: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("appsecQuery() blocked while handling the request body")
+			}
+		})
+	}
+}
+
+func Test_appsecQuery_oversizedResponse(t *testing.T) {
+	testCases := []struct {
+		name       string
+		statusCode int
+		wantErr    bool
+	}{
+		{name: "OK passes", statusCode: http.StatusOK, wantErr: false},
+		{name: "Forbidden blocks", statusCode: http.StatusForbidden, wantErr: true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			appsecServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+				rw.WriteHeader(tc.statusCode)
+				_, _ = io.WriteString(rw, strings.Repeat("x", int(appsecResponseBodyLimit)+1))
+			}))
+			defer appsecServer.Close()
+
+			appsecURL, _ := url.Parse(appsecServer.URL)
+			bouncer := &Bouncer{
+				appsecScheme:     appsecURL.Scheme,
+				appsecHost:       appsecURL.Host,
+				appsecPath:       "/",
+				appsecBodyLimit:  1000,
+				httpAppsecClient: appsecServer.Client(),
+				log:              logger.New("INFO", ""),
+			}
+
+			decision, err := appsecQuery(bouncer, "1.2.3.4", httptest.NewRequest(http.MethodGet, "http://localhost/", nil))
+			if tc.wantErr && err == nil {
+				t.Fatal("appsecQuery() expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("appsecQuery() returned error: %v", err)
+			}
+			if decision != nil {
+				t.Fatalf("appsecQuery() returned decision: %v", decision)
+			}
+		})
+	}
+}
+
+func TestHandleNextServeHTTPRelaysStructuredAppsecChallenge(t *testing.T) {
+	appsecServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{
+			"action":"challenge",
+			"http_status":200,
+			"user_body_content":"<html>challenge</html>",
+			"user_cookies":["__crowdsec_challenge=value; Path=/; HttpOnly"],
+			"user_headers":{
+				"Content-Type":["text/html"],
+				"Cache-Control":["no-store"]
+			}
+		}`))
+	}))
+	defer appsecServer.Close()
+
+	appsecURL, err := url.Parse(appsecServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nextCalled := false
+	bouncer := &Bouncer{
+		next: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			nextCalled = true
+		}),
+		appsecEnabled:           true,
+		appsecScheme:            appsecURL.Scheme,
+		appsecHost:              appsecURL.Host,
+		appsecPath:              "/",
+		httpAppsecClient:        appsecServer.Client(),
+		remediationStatusCode:   http.StatusForbidden,
+		remediationCustomHeader: "X-Remediation",
+		log:                     logger.New("DEBUG", ""),
+	}
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/protected", nil)
+	bouncer.handleNextServeHTTP(recorder, req, "192.0.2.10")
+
+	if nextCalled {
+		t.Fatal("next handler should not be called for appsec challenge")
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected challenge status 200, got %d", recorder.Code)
+	}
+	if got := recorder.Body.String(); got != "<html>challenge</html>" {
+		t.Fatalf("expected appsec challenge body, got %q", got)
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "text/html" {
+		t.Fatalf("expected Content-Type relayed, got %q", got)
+	}
+	if got := recorder.Header().Get("Set-Cookie"); got != "__crowdsec_challenge=value; Path=/; HttpOnly" {
+		t.Fatalf("expected Set-Cookie relayed, got %q", got)
+	}
+	if got := recorder.Header().Get("X-Remediation"); got != "challenge" {
+		t.Fatalf("expected custom remediation header challenge, got %q", got)
+	}
+}
+
+func serveAppsecEnvelope(t *testing.T, envelope string, recorder *httptest.ResponseRecorder) bool {
+	t.Helper()
+	appsecServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(envelope))
+	}))
+	defer appsecServer.Close()
+
+	appsecURL, err := url.Parse(appsecServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nextCalled := false
+	bouncer := &Bouncer{
+		next: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			nextCalled = true
+		}),
+		appsecEnabled:           true,
+		appsecScheme:            appsecURL.Scheme,
+		appsecHost:              appsecURL.Host,
+		appsecPath:              "/",
+		httpAppsecClient:        appsecServer.Client(),
+		remediationStatusCode:   http.StatusForbidden,
+		remediationCustomHeader: "X-Remediation",
+		log:                     logger.New("DEBUG", ""),
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/protected", nil)
+	bouncer.handleNextServeHTTP(recorder, req, "192.0.2.10")
+	return nextCalled
+}
+
+func TestHandleNextServeHTTPAppsecChallengeWithoutBodyFallsBackToBan(t *testing.T) {
+	tests := []struct {
+		name     string
+		envelope string
+	}{
+		{name: "missing body", envelope: `{"action":"challenge","http_status":200}`},
+		{name: "empty body", envelope: `{"action":"challenge","http_status":200,"user_body_content":""}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			if serveAppsecEnvelope(t, tt.envelope, recorder) {
+				t.Fatal("next handler should not be called for an appsec challenge without body")
+			}
+			if recorder.Code != http.StatusForbidden {
+				t.Fatalf("expected fallback ban status 403, got %d", recorder.Code)
+			}
+			if got := recorder.Header().Get("X-Remediation"); got != "ban" {
+				t.Fatalf("expected fallback remediation header ban, got %q", got)
+			}
+		})
+	}
+}
+
+func TestHandleNextServeHTTPAppsecChallengeReplacesHeaders(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	recorder.Header().Set("Content-Security-Policy", "default-src 'none'")
+	recorder.Header().Set("Cache-Control", "public, max-age=3600")
+	envelope := `{
+		"action":"challenge",
+		"http_status":200,
+		"user_body_content":"<html>challenge</html>",
+		"user_cookies":["first=1; Path=/","second=2; Path=/"],
+		"user_headers":{
+			"Content-Security-Policy":["script-src 'self' 'unsafe-inline'"],
+			"Cache-Control":["no-store"]
+		}
+	}`
+	if serveAppsecEnvelope(t, envelope, recorder) {
+		t.Fatal("next handler should not be called for appsec challenge")
+	}
+	if got := recorder.Header().Values("Content-Security-Policy"); len(got) != 1 || got[0] != "script-src 'self' 'unsafe-inline'" {
+		t.Fatalf("expected only the challenge Content-Security-Policy, got %q", got)
+	}
+	if got := recorder.Header().Values("Cache-Control"); len(got) != 1 || got[0] != "no-store" {
+		t.Fatalf("expected only the challenge Cache-Control, got %q", got)
+	}
+	if got := recorder.Header().Values("Set-Cookie"); len(got) != 2 {
+		t.Fatalf("expected two separate Set-Cookie headers, got %q", got)
+	}
+}
+
+func TestHandleNextServeHTTPLegacyAppsecForbiddenFallsBackToBan(t *testing.T) {
+	appsecServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer appsecServer.Close()
+
+	appsecURL, err := url.Parse(appsecServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nextCalled := false
+	bouncer := &Bouncer{
+		next: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			nextCalled = true
+		}),
+		appsecEnabled:           true,
+		appsecScheme:            appsecURL.Scheme,
+		appsecHost:              appsecURL.Host,
+		appsecPath:              "/",
+		httpAppsecClient:        appsecServer.Client(),
+		remediationStatusCode:   http.StatusForbidden,
+		remediationCustomHeader: "X-Remediation",
+		log:                     logger.New("DEBUG", ""),
+	}
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/protected", nil)
+	bouncer.handleNextServeHTTP(recorder, req, "192.0.2.10")
+
+	if nextCalled {
+		t.Fatal("next handler should not be called for appsec forbidden")
+	}
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected fallback ban status 403, got %d", recorder.Code)
+	}
+	if got := recorder.Header().Get("X-Remediation"); got != "ban" {
+		t.Fatalf("expected fallback remediation header ban, got %q", got)
+	}
+}
+
+// Test_appsecQuery_reusesConnection is a regression test for issue #384: the appsec response
+// body must be drained for non-200 status response so net/http can return the conn to the idle pool.
+func Test_appsecQuery_reusesConnection(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusForbidden, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var mu sync.Mutex
+			conns := map[string]bool{}
+			appsecServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				conns[r.RemoteAddr] = true
+				mu.Unlock()
+				rw.WriteHeader(status)
+				if _, errWrite := rw.Write([]byte(`{"action":"allow"}`)); errWrite != nil {
+					t.Errorf("appsec stub write: %v", errWrite)
+				}
+			}))
+			defer appsecServer.Close()
+
+			appsecURL, _ := url.Parse(appsecServer.URL)
+			bouncer := &Bouncer{
+				appsecScheme:       appsecURL.Scheme,
+				appsecHost:         appsecURL.Host,
+				appsecPath:         "/",
+				appsecBodyLimit:    10485760,
+				appsecFailureBlock: false,
+				httpAppsecClient:   appsecServer.Client(),
+				log:                logger.New("INFO", ""),
+			}
+
+			const calls = 10
+			for i := 0; i < calls; i++ { //nolint:intrange
+				req, _ := http.NewRequest(http.MethodGet, "http://localhost/", nil)
+				_, _ = appsecQuery(bouncer, "1.2.3.4", req)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			if len(conns) != 1 {
+				t.Errorf("appsecQuery() opened %d connections for %d calls, want 1 (response body not drained?)", len(conns), calls)
+			}
+		})
+	}
+}
+
+func TestHandleNextServeHTTPStructuredBanKeepsBanTemplate(t *testing.T) {
+	appsecServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"action":"ban","http_status":403,"user_body_content":"appsec default page"}`))
+	}))
+	defer appsecServer.Close()
+
+	appsecURL, err := url.Parse(appsecServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	banTemplate, err := template.New("ban").Parse("<html>BAN ip={{.ClientIP}} reason={{.RemediationReason}}</html>")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nextCalled := false
+	bouncer := &Bouncer{
+		next: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			nextCalled = true
+		}),
+		appsecEnabled:           true,
+		appsecScheme:            appsecURL.Scheme,
+		appsecHost:              appsecURL.Host,
+		appsecPath:              "/",
+		httpAppsecClient:        appsecServer.Client(),
+		remediationStatusCode:   http.StatusForbidden,
+		remediationCustomHeader: "X-Remediation",
+		banTemplate:             banTemplate,
+		banTemplateContentType:  "text/html; charset=utf-8",
+		log:                     logger.New("ERROR", ""),
+	}
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/protected", nil)
+	bouncer.handleNextServeHTTP(recorder, req, "192.0.2.10")
+
+	if nextCalled {
+		t.Fatal("next handler should not be called for an appsec ban")
+	}
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", recorder.Code)
+	}
+	want := "<html>BAN ip=192.0.2.10 reason=APPSEC</html>"
+	if got := recorder.Body.String(); got != want {
+		t.Fatalf("appsec ban must keep the configured ban template, got %q want %q", got, want)
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "text/html; charset=utf-8" {
+		t.Fatalf("expected banTemplateContentType, got %q", got)
+	}
+	if got := recorder.Header().Get("X-Remediation"); got != "ban" {
+		t.Fatalf("expected remediation header ban, got %q", got)
+	}
+}
+
+func Test_appsecQuery_unreadableBodyMethods(t *testing.T) {
+	appsecServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	}))
+	defer appsecServer.Close()
+
+	appsecURL, _ := url.Parse(appsecServer.URL)
+
+	tests := []struct {
+		method      string
+		wantDropped bool
+	}{
+		{method: http.MethodGet, wantDropped: false},
+		{method: http.MethodHead, wantDropped: false},
+		{method: http.MethodOptions, wantDropped: false},
+		{method: http.MethodDelete, wantDropped: false},
+		{method: http.MethodPost, wantDropped: true},
+		{method: http.MethodPut, wantDropped: true},
+		{method: http.MethodPatch, wantDropped: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			bouncer := &Bouncer{
+				appsecScheme:              appsecURL.Scheme,
+				appsecHost:                appsecURL.Host,
+				appsecPath:                "/",
+				appsecBodyLimit:           10485760,
+				appsecUnreadableBodyBlock: true,
+				httpAppsecClient:          appsecServer.Client(),
+				log:                       logger.New("INFO", ""),
+			}
+
+			done := make(chan struct{})
+			defer close(done)
+
+			finished := make(chan error, 1)
+			go func() {
+				_, err := appsecQuery(bouncer, "1.2.3.4", newUnreadableRequest(tt.method, done))
+				finished <- err
+			}()
+
+			select {
+			case err := <-finished:
+				if tt.wantDropped && err == nil {
+					t.Errorf("appsecQuery() on an unreadable-body %s: expected the request to be dropped, got nil", tt.method)
+				}
+				if !tt.wantDropped && err != nil {
+					t.Errorf("appsecQuery() on a bodyless HTTP/3 %s returned error: %v", tt.method, err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("appsecQuery() blocked on an unreadable %s body", tt.method)
+			}
+		})
+	}
+}
+
+// Test_appsecQuery_forwardsHTTPVersion verifies that the client HTTP version
+// is forwarded to CrowdSec AppSec via X-Crowdsec-Appsec-Http-Version.
+func Test_appsecQuery_forwardsHTTPVersion(t *testing.T) {
+	tests := []struct {
+		name        string
+		protoMajor  int
+		protoMinor  int
+		expectedHdr string
+	}{
+		{
+			name:        "HTTP/1.0",
+			protoMajor:  1,
+			protoMinor:  0,
+			expectedHdr: "10",
+		},
+		{
+			name:        "HTTP/1.1",
+			protoMajor:  1,
+			protoMinor:  1,
+			expectedHdr: "11",
+		},
+		{
+			name:        "HTTP/2.0",
+			protoMajor:  2,
+			protoMinor:  0,
+			expectedHdr: "20",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var capturedVersion string
+			appsecServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+				capturedVersion = r.Header.Get(crowdsecAppsecHTTPVersionHeader)
+				rw.WriteHeader(http.StatusOK)
+				if _, err := rw.Write([]byte(`{"action":"allow"}`)); err != nil {
+					t.Errorf("write response: %v", err)
+				}
+			}))
+			defer appsecServer.Close()
+
+			appsecURL, _ := url.Parse(appsecServer.URL)
+			bouncer := &Bouncer{
+				appsecScheme:       appsecURL.Scheme,
+				appsecHost:         appsecURL.Host,
+				appsecPath:         "/",
+				appsecBodyLimit:    10485760,
+				appsecFailureBlock: false,
+				httpAppsecClient:   appsecServer.Client(),
+				log:                logger.New("INFO", ""),
+			}
+
+			req, _ := http.NewRequest(http.MethodGet, "http://localhost/", nil)
+			req.ProtoMajor = tt.protoMajor
+			req.ProtoMinor = tt.protoMinor
+
+			_, err := appsecQuery(bouncer, "1.2.3.4", req)
+			if err != nil {
+				t.Fatalf("appsecQuery() unexpected error: %v", err)
+			}
+
+			if capturedVersion != tt.expectedHdr {
+				t.Errorf("expected %s header %q, got %q", crowdsecAppsecHTTPVersionHeader, tt.expectedHdr, capturedVersion)
+			}
+		})
+	}
+}
+
+func TestServeHTTPServesAppsecCaptchaInAppsecMode(t *testing.T) {
+	appsecServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusForbidden)
+		_, _ = rw.Write([]byte(`{"action":"captcha","http_status":403}`))
+	}))
+	defer appsecServer.Close()
+
+	appsecURL, err := url.Parse(appsecServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := CreateConfig()
+	cfg.Enabled = true
+	cfg.CrowdsecMode = configuration.AppsecMode
+	cfg.CrowdsecLapiKey = "test"
+	cfg.CrowdsecAppsecEnabled = true
+	cfg.CrowdsecAppsecHost = appsecURL.Host
+	cfg.CaptchaProvider = configuration.HcaptchaProvider
+	cfg.CaptchaSiteKey = "test-site-key"
+	cfg.CaptchaSecretKey = "secret"
+	cfg.CaptchaFilePath = "captcha.html"
+	nextCalled := false
+	handler, err := New(context.Background(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		nextCalled = true
+	}), cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheClient := &cache.Client{}
+	cacheClient.New(logger.New("INFO", ""), false, "", nil, "", "")
+	t.Cleanup(func() { cacheClient.Delete("192.0.2.30_captcha") })
+
+	for _, solved := range []bool{false, true} {
+		nextCalled = false
+		if solved {
+			cacheClient.Set("192.0.2.30_captcha", cache.CaptchaDoneValue, 60)
+		}
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req.RemoteAddr = "192.0.2.30:1234"
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+
+		if nextCalled != solved {
+			t.Errorf("solved=%t: expected next handler called=%t", solved, solved)
+		}
+		if !solved && (recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "test-site-key")) {
+			t.Errorf("expected the captcha page, got status %d", recorder.Code)
+		}
+	}
+}
+
+func TestHandleNextServeHTTPKeepsChallengePathsFromTheBackend(t *testing.T) {
+	appsecServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	}))
+	defer appsecServer.Close()
+
+	appsecURL, err := url.Parse(appsecServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextCalled := false
+	bouncer := &Bouncer{
+		next: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			nextCalled = true
+		}),
+		appsecEnabled:    true,
+		appsecScheme:     appsecURL.Scheme,
+		appsecHost:       appsecURL.Host,
+		appsecPath:       "/",
+		httpAppsecClient: appsecServer.Client(),
+		log:              logger.New("INFO", ""),
+	}
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/crowdsec-internal/challenge/custom.js", nil)
+	bouncer.handleNextServeHTTP(recorder, req, "192.0.2.10")
+
+	if nextCalled || recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected a 404 without reaching the backend, got status %d (next called: %t)", recorder.Code, nextCalled)
+	}
+}
+
+// A body that cannot be read (client aborted the upload) must not be turned into a ban (issue #395).
+func TestHandleNextServeHTTPBodyReadErrorIsNotABan(t *testing.T) {
+	tests := []struct {
+		name       string
+		clientGone bool
+		wantStatus int
+	}{
+		{name: "client gone", clientGone: true, wantStatus: statusClientClosedRequest},
+		{name: "client still connected", clientGone: false, wantStatus: http.StatusBadRequest},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bouncer := &Bouncer{
+				appsecEnabled:         true,
+				appsecBodyLimit:       10485760,
+				remediationStatusCode: http.StatusForbidden,
+				log:                   logger.New("DEBUG", ""),
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.clientGone {
+				cancel()
+			}
+			req := httptest.NewRequest(http.MethodPost, "http://example.com/upload", iotest.ErrReader(io.ErrUnexpectedEOF)).WithContext(ctx)
+			recorder := httptest.NewRecorder()
+			blockedBefore := atomic.LoadInt64(&blockedRequests)
+
+			bouncer.handleNextServeHTTP(recorder, req, "192.0.2.10")
+
+			if recorder.Code != tc.wantStatus {
+				t.Errorf("expected status %d, got %d", tc.wantStatus, recorder.Code)
+			}
+			if got := atomic.LoadInt64(&blockedRequests) - blockedBefore; got != 0 {
+				t.Errorf("expected no blocked request to be counted, got %d", got)
 			}
 		})
 	}

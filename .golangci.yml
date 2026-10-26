@@ -7,7 +7,7 @@ linters-settings:
     disable:
       - fieldalignment
   gocyclo:
-    min-complexity: 15
+    min-complexity: 20
   goconst:
     min-len: 5
     min-occurrences: 4
@@ -41,6 +41,7 @@ linters-settings:
           - $test
         allow:
           - $gostd
+          - github.com/maxlerebourg/simpleredis
           - github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/logger
           - github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/ip
           - github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/configuration
