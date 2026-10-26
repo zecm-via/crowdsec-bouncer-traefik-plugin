@@ -114,17 +114,18 @@ make -k e2e_mock
 git diff --check
 ```
 
-Create the release base branch `tu/v1.8.1` at upstream `v1.8.1` and open a PR
-from `tu/v1.8.1-appsec-captcha` into it. This keeps the release based on the
-exact upstream tag independently of the fork's `main` branch. After checks
-pass and the PR is merged, tag the merged release commit:
+The release base branch `tu/v1.8.1` starts at upstream `v1.8.1`. Keep the
+release independent of the fork's `main` branch. When GitHub PR permissions are
+available, open a PR from `tu/v1.8.1-appsec-captcha` into the release branch.
+The existing SSH-based tag workflow also supports publishing a validated TU
+commit directly by fast-forwarding the release branch:
 
 ```bash
 git fetch origin
 git switch tu/v1.8.1
-git pull --ff-only
+git merge --ff-only tu/v1.8.1-appsec-captcha
 git tag -a v1.8.1-tu.1 -m "Upstream v1.8.1 with TU AppSec CAPTCHA support"
-git push origin v1.8.1-tu.1
+git push --atomic origin tu/v1.8.1 tu/v1.8.1-appsec-captcha v1.8.1-tu.1
 ```
 
 Traefik static plugin config should then use:
@@ -141,6 +142,7 @@ Use a new tag for every TU patch, for example:
 
 - `v1.6.0-tu.1`
 - `v1.6.0-tu.2`
+- `v1.7.1-tu.1`
 - `v1.8.1-tu.1`
 
 ## Upstream sync workflow
@@ -168,5 +170,5 @@ Then re-apply/cherry-pick the TU patch. During conflict resolution, keep:
 - The AppSec CAPTCHA behavior documented in `TU-001`.
 
 Update this document and `version.go`, run the validation commands above,
-open a PR against the corresponding TU release base, and tag the merged commit.
-Never move an existing release tag.
+publish the validated commit through the release workflow above, and use a new
+tag for every release. Never move an existing release tag.
