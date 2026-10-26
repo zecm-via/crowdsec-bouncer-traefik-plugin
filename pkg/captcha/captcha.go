@@ -2,16 +2,18 @@
 package captcha
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
 	"text/template"
 
-	cache "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/cache"
-	configuration "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/configuration"
+	cache "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/cache"
+	configuration "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/configuration"
 )
 
 // Client Captcha client.
@@ -123,6 +125,40 @@ func (c *Client) Check(remoteIP string) bool {
 	passed := value == cache.CaptchaDoneValue
 	c.log.Debug(fmt.Sprintf("captcha:Check ip:%s pass:%v", remoteIP, passed))
 	return passed
+}
+
+// IsValidationRequest reports whether the request carries the configured
+// CAPTCHA response field. This lets the bouncer route AppSec-triggered CAPTCHA
+// validation posts to the CAPTCHA provider without hardcoding provider-specific
+// form field names.
+func (c *Client) IsValidationRequest(r *http.Request) bool {
+	if c == nil || c.infoProvider == nil || c.infoProvider.response == "" || r.Method != http.MethodPost {
+		return false
+	}
+	// FormValue consumes form bodies even when the CAPTCHA field is absent.
+	// Replay the bytes it reads so AppSec and the backend receive the full body.
+	if r.Body != nil {
+		body := r.Body
+		var buffered bytes.Buffer
+		r.Body = &replayBody{reader: io.TeeReader(body, &buffered), original: body}
+		defer func() {
+			r.Body = &replayBody{reader: io.MultiReader(&buffered, body), original: body}
+		}()
+	}
+	return r.FormValue(c.infoProvider.response) != ""
+}
+
+type replayBody struct {
+	reader   io.Reader
+	original io.ReadCloser
+}
+
+func (b *replayBody) Read(p []byte) (int, error) {
+	return b.reader.Read(p)
+}
+
+func (b *replayBody) Close() error {
+	return b.original.Close()
 }
 
 type responseProvider struct {

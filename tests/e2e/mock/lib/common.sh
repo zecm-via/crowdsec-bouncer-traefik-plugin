@@ -178,8 +178,8 @@ start_stack() {
 
   WORKDIR="$(mktemp -d)"
   # Expose the plugin source where Traefik's localPlugins loader expects it.
-  mkdir -p "$WORKDIR/plugins-local/src/github.com/maxlerebourg"
-  ln -s "$REPO_ROOT" "$WORKDIR/plugins-local/src/github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin"
+  mkdir -p "$WORKDIR/plugins-local/src/github.com/zecm-via"
+  ln -s "$REPO_ROOT" "$WORKDIR/plugins-local/src/github.com/zecm-via/crowdsec-bouncer-traefik-plugin"
 
   cp "$MOCK_LIB_DIR/traefik.yml" "$WORKDIR/traefik.yml"
 
