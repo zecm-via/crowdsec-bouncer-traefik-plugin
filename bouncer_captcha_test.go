@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
-	cache "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/cache"
-	captcha "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/captcha"
-	configuration "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/configuration"
-	logger "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/logger"
+	cache "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/cache"
+	captcha "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/captcha"
+	configuration "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/configuration"
+	logger "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/logger"
 )
 
 func TestSolvedCaptchaSubmission(t *testing.T) {

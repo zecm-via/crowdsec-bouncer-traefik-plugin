@@ -16,8 +16,8 @@ import (
 	"strings"
 	"text/template"
 
-	ip "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/ip"
-	location "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/location"
+	ip "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/ip"
+	location "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/location"
 )
 
 // Enums for crowdsec mode.

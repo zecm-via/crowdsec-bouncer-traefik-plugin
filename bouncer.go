@@ -19,15 +19,17 @@ import (
 	"text/template"
 	"time"
 
-	cache "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/cache"
-	captcha "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/captcha"
-	configuration "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/configuration"
-	ip "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/ip"
-	location "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/location"
-	logger "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/logger"
+	cache "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/cache"
+	captcha "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/captcha"
+	configuration "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/configuration"
+	ip "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/ip"
+	location "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/location"
+	logger "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/logger"
 )
 
 const (
+	crowdsecCaptchaSolved           = "X-Crowdsec-Captcha-Solved"
+	appsecCaptchaPendingTTL         = 300
 	crowdsecAppsecIPHeader          = "X-Crowdsec-Appsec-Ip"
 	crowdsecAppsecURIHeader         = "X-Crowdsec-Appsec-Uri"
 	crowdsecAppsecHostHeader        = "X-Crowdsec-Appsec-Host"
@@ -115,6 +117,7 @@ type Bouncer struct {
 	updateInterval            int64
 	updateMaxFailure          int64
 	defaultDecisionTimeout    int64
+	captchaGracePeriodSeconds int64
 	remediationStatusCode     int
 	remediationCustomHeader   string
 	forwardedCustomHeader     string
@@ -249,6 +252,7 @@ func New(_ context.Context, next http.Handler, config *configuration.Config, nam
 		remediationCustomHeader:   config.RemediationHeadersCustomName,
 		forwardedCustomHeader:     config.ForwardedHeadersCustomName,
 		defaultDecisionTimeout:    config.DefaultDecisionSeconds,
+		captchaGracePeriodSeconds: config.CaptchaGracePeriodSeconds,
 		remediationStatusCode:     config.RemediationStatusCode,
 		redisUnreachableBlock:     config.RedisCacheUnreachableBlock,
 		banTemplate:               banTemplate,
@@ -356,6 +360,10 @@ func New(_ context.Context, next http.Handler, config *configuration.Config, nam
 //
 //nolint:nestif
 func (bouncer *Bouncer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	// This header is internal between the Traefik plugin and AppSec. Strip any
+	// client-supplied value before we optionally add a trusted value ourselves.
+	req.Header.Del(crowdsecCaptchaSolved)
+
 	if !bouncer.enabled {
 		bouncer.next.ServeHTTP(rw, req)
 		return
@@ -518,8 +526,18 @@ func (bouncer *Bouncer) handleRemediationServeHTTP(rw http.ResponseWriter, req *
 }
 
 func (bouncer *Bouncer) handleNextServeHTTP(rw http.ResponseWriter, req *http.Request, remoteIP string) {
+	if bouncer.shouldHandleAppsecCaptchaValidation(req, remoteIP) {
+		bouncer.captchaClient.ServeHTTP(rw, req, remoteIP)
+		if bouncer.captchaClient.Check(remoteIP) {
+			bouncer.cacheClient.Delete(appsecCaptchaPendingKey(remoteIP))
+		}
+		return
+	}
+
 	if bouncer.appsecEnabled && !bouncer.isAppsecExcluded(req, remoteIP) {
+		cleanupCaptchaSolvedHeader := bouncer.setCaptchaSolvedAppsecHeader(req, remoteIP)
 		decision, err := appsecQuery(bouncer, remoteIP, req)
+		cleanupCaptchaSolvedHeader()
 		if err != nil {
 			bouncer.log.Debug(fmt.Sprintf("handleNextServeHTTP ip:%s isWaf:true %s", remoteIP, err.Error()))
 			bouncer.handleAppsecErrorServeHTTP(rw, req, remoteIP, err)
@@ -558,6 +576,7 @@ func (bouncer *Bouncer) handleAppsecDecisionServeHTTP(rw http.ResponseWriter, re
 			bouncer.captchaClient.ServeSolved(rw, req)
 			return true
 		}
+		bouncer.setAppsecCaptchaPending(remoteIP)
 		atomic.AddInt64(&blockedRequests, 1)
 		bouncer.captchaClient.ServeHTTP(rw, req, remoteIP)
 	case decision.HTTPStatus >= http.StatusOK && decision.HTTPStatus <= 599:
@@ -605,6 +624,53 @@ func (bouncer *Bouncer) handleAppsecResponseServeHTTP(rw http.ResponseWriter, re
 	if _, err := rw.Write([]byte(decision.UserBodyContent)); err != nil {
 		bouncer.log.Warn("handleAppsecResponseServeHTTP could not write appsec response: " + err.Error())
 	}
+}
+
+func (bouncer *Bouncer) setCaptchaSolvedAppsecHeader(req *http.Request, remoteIP string) func() {
+	if bouncer.captchaClient == nil || !bouncer.captchaClient.Valid || !bouncer.captchaClient.Check(remoteIP) {
+		return func() {}
+	}
+
+	previous, existed := req.Header[crowdsecCaptchaSolved]
+	req.Header.Set(crowdsecCaptchaSolved, "1")
+
+	return func() {
+		if existed {
+			req.Header[crowdsecCaptchaSolved] = previous
+			return
+		}
+		req.Header.Del(crowdsecCaptchaSolved)
+	}
+}
+
+func (bouncer *Bouncer) shouldHandleAppsecCaptchaValidation(req *http.Request, remoteIP string) bool {
+	if bouncer.captchaClient == nil || !bouncer.captchaClient.Valid || bouncer.cacheClient == nil || isBodyUnreadable(req) {
+		return false
+	}
+	value, err := bouncer.cacheClient.Get(appsecCaptchaPendingKey(remoteIP))
+	if err != nil || value != cache.CaptchaValue {
+		return false
+	}
+	if bouncer.captchaClient.Check(remoteIP) {
+		return false
+	}
+	return bouncer.captchaClient.IsValidationRequest(req)
+}
+
+func (bouncer *Bouncer) setAppsecCaptchaPending(remoteIP string) {
+	if bouncer.cacheClient == nil {
+		return
+	}
+
+	ttl := bouncer.captchaGracePeriodSeconds
+	if ttl <= 0 {
+		ttl = appsecCaptchaPendingTTL
+	}
+	bouncer.cacheClient.Set(appsecCaptchaPendingKey(remoteIP), cache.CaptchaValue, ttl)
+}
+
+func appsecCaptchaPendingKey(remoteIP string) string {
+	return remoteIP + "_appsec_captcha"
 }
 
 func handleStreamTicker(bouncer *Bouncer) {

@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	logger "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/pkg/logger"
+	logger "github.com/zecm-via/crowdsec-bouncer-traefik-plugin/pkg/logger"
 )
 
 func Test_GetRemoteIP(t *testing.T) {
