@@ -13,17 +13,20 @@ TU fork module path:
 
 Target TU release base:
 
-- upstream tag: `v1.8.1`
-- upstream tag commit: `f9c85b1472d618e9188a025c9b2308d0b27e5321`
-- TU release tag: `v1.8.1-tu.1`
-- date: `2026-10-26`
+- upstream tag: `v1.8.2`
+- upstream tag commit: `b0431e2e530cadd629583288909b462c8a6e9669`
+- TU release tag: `v1.8.2-tu.1`
+- date: `2026-11-23`
+
+Ported from `v1.8.1-tu.1` by cherry-picking `4d2eda8` (TU-001) and
+`07037de` (release workflow documentation), then adapting to upstream v1.8.2.
 
 Important:
 
-- Do not create `v1.8.1-tu.1` from the current fork `main` branch.
-- The fork `main` can contain commits newer than upstream `v1.8.1`.
+- Do not create `v1.8.2-tu.1` from the current fork `main` branch.
+- The fork `main` can contain commits newer than upstream `v1.8.2`.
 - The TU release tag must be exactly:
-  `upstream v1.8.1 + TU-001 patch`.
+  `upstream v1.8.2 + TU-001 patch`.
 
 ## TU-001: AppSec-triggered CAPTCHA support
 
@@ -43,10 +46,11 @@ Changed files:
   - Adds internal header name `X-Crowdsec-Captcha-Solved`.
   - Removes any client-supplied `X-Crowdsec-Captcha-Solved` header before
     processing.
-  - Uses upstream v1.8.1 structured AppSec responses and CAPTCHA rendering.
+  - Uses upstream v1.8.2 structured AppSec responses and CAPTCHA rendering.
     Invalid responses still fail closed; upstream bot-detection challenges,
     response-size limits, HTTP version forwarding, and body-read error handling
-    are preserved.
+    are preserved. The v1.8.2 AppSec excluded locations, custom response status
+    codes, and failure/unreachable handling are also preserved.
   - Records a short pending AppSec CAPTCHA marker so the CAPTCHA validation POST
     is handled by the plugin.
   - After successful CAPTCHA, temporarily adds `X-Crowdsec-Captcha-Solved: 1`
@@ -55,12 +59,14 @@ Changed files:
     cloned request shares the original request body; reading the clone consumed
     form POST bodies before they reached GitLab.
   - Skips CAPTCHA form inspection for unreadable streaming bodies and keeps
-    upstream v1.8.1 AppSec unreadable-body handling intact:
+    upstream v1.8.2 AppSec unreadable-body handling intact:
     HTTP/2+/HTTP/3 streaming bodies without `Content-Length` are not read for
     AppSec, preventing false 403s/timeouts on long-lived streams.
 - `pkg/captcha/captcha.go`
   - Adds `IsValidationRequest()` so the bouncer can detect the configured
     CAPTCHA response field without hardcoding provider-specific form names.
+  - Keeps upstream v1.8.2 `HasResponse()` and `ServeSolved()` behavior for
+    repeated submissions after a CAPTCHA has already been solved.
   - Preserves bytes consumed during form inspection, so an unrelated POST while
     CAPTCHA is pending reaches AppSec and the backend with its original body.
 - `bouncer_test.go`
@@ -77,7 +83,7 @@ Changed files:
 - `.golangci.yml` and `tests/e2e/mock/lib/`
   - Use the TU module path for linting and Traefik integration checks.
 - `version.go`
-  - Reports `v1.8.1-tu.1` to AppSec and LAPI.
+  - Reports `v1.8.2-tu.1` to AppSec and LAPI.
 - `go.mod`, `.traefik.yml`, and Go imports in test/package files
   - Change module/import path from upstream to the TU fork path:
     `github.com/zecm-via/crowdsec-bouncer-traefik-plugin`.
@@ -91,14 +97,14 @@ SecRule REQUEST_HEADERS:X-Crowdsec-Captcha-Solved "@streq 1" "id:500019,phase:1,
 This rule must be evaluated before the GitLab anonymous CAPTCHA rules. It should
 only remove those CAPTCHA rules, not disable AppSec globally.
 
-## Build the TU branch from exact upstream v1.8.1
+## Build the TU branch from exact upstream v1.8.2
 
 Create the real TU release branch from the exact upstream tag:
 
 ```bash
 git remote get-url upstream || git remote add upstream https://github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin.git
-git fetch upstream tag v1.8.1
-git checkout -b tu/v1.8.1-appsec-captcha v1.8.1
+git fetch upstream tag v1.8.2
+git checkout -b tu/v1.8.2-appsec-captcha v1.8.2
 ```
 
 ## Validation and release workflow
@@ -114,18 +120,22 @@ make -k e2e_mock
 git diff --check
 ```
 
-The release base branch `tu/v1.8.1` starts at upstream `v1.8.1`. Keep the
+Port validation on `2026-11-23`: Go 1.22.12 tests, golangci-lint v1.63.4,
+Yaegi v0.16.1 tests, all 10 mock integration scenarios with Traefik v3.7.17,
+and the diff whitespace check passed.
+
+The release base branch `tu/v1.8.2` starts at upstream `v1.8.2`. Keep the
 release independent of the fork's `main` branch. When GitHub PR permissions are
-available, open a PR from `tu/v1.8.1-appsec-captcha` into the release branch.
+available, open a PR from `tu/v1.8.2-appsec-captcha` into the release branch.
 The existing SSH-based tag workflow also supports publishing a validated TU
 commit directly by fast-forwarding the release branch:
 
 ```bash
 git fetch origin
-git switch tu/v1.8.1
-git merge --ff-only tu/v1.8.1-appsec-captcha
-git tag -a v1.8.1-tu.1 -m "Upstream v1.8.1 with TU AppSec CAPTCHA support"
-git push --atomic origin tu/v1.8.1 tu/v1.8.1-appsec-captcha v1.8.1-tu.1
+git switch tu/v1.8.2
+git merge --ff-only tu/v1.8.2-appsec-captcha
+git tag -a v1.8.2-tu.1 -m "Upstream v1.8.2 with TU AppSec CAPTCHA support"
+git push --atomic origin tu/v1.8.2 tu/v1.8.2-appsec-captcha v1.8.2-tu.1
 ```
 
 Traefik static plugin config should then use:
@@ -135,7 +145,7 @@ experimental:
   plugins:
     crowdsec-bouncer:
       moduleName: github.com/zecm-via/crowdsec-bouncer-traefik-plugin
-      version: v1.8.1-tu.1
+      version: v1.8.2-tu.1
 ```
 
 Use a new tag for every TU patch, for example:
@@ -144,6 +154,7 @@ Use a new tag for every TU patch, for example:
 - `v1.6.0-tu.2`
 - `v1.7.1-tu.1`
 - `v1.8.1-tu.1`
+- `v1.8.2-tu.1`
 
 ## Upstream sync workflow
 
